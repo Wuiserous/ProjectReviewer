@@ -15,7 +15,7 @@ from google.genai import types
 # ==========================================
 st.set_page_config(page_title="Strict Student Project Evaluator", layout="wide")
 
-API_KEY = 'AIzaSyCs3zZEYgqUe-_RZoDgcsTvy2kq19aidCw'
+API_KEY = st.secrets['API_KEY']
 try:
     client = genai.Client(api_key=API_KEY)
 except Exception as e:
