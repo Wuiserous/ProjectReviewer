@@ -997,30 +997,78 @@ class EvaluationResult(BaseModel):
     overall_status: str = Field(description="'PASS' only if ALL attempted projects pass. Otherwise 'REJECT'.")
     evaluations: list[ProjectEvaluation]
 
+class PassProjectEvaluation(BaseModel):
+    project_name: str
+    status: str = Field(description="Must be 'PASS'")
+    suggestions: list[str] = Field(description="Constructive list of suggestions for improvement. Empty if perfectly implemented.")
+    email_subject: str = Field(description="Subject line for the student email.")
+    email_body: str = Field(description="Highly professional email body stating constructive feedback.")
 
-def evaluate_submission(parsed_submission, active_rubrics):
+class PassEvaluationResult(BaseModel):
+    overall_status: str = Field(description="Must be 'PASS'.")
+    evaluations: list[PassProjectEvaluation]
+
+class ReviewProjectEvaluation(BaseModel):
+    project_name: str
+    comprehensive_analysis_report: str = Field(description="A highly detailed markdown analysis report covering all aspects of the submission.")
+
+class ReviewEvaluationResult(BaseModel):
+    overall_status: str = Field(description="Must be 'REVIEW COMPLETED'.")
+    evaluations: list[ReviewProjectEvaluation]
+
+
+def evaluate_submission(parsed_submission, active_rubrics, mode, additional_instructions=""):
     submission_text = ""
     for filepath, content in parsed_submission.items():
         submission_text += f"\n\n{'=' * 40}\nFILE: {filepath}\n{'=' * 40}\n{content}"
 
-    # REJECTION-BIASED INSTRUCTION
-    system_instruction = """
-    You are an elite, hyper-critical technical project auditor. Your ultimate objective is to meticulously scrutinize the submission and find valid, rule-based reasons to REJECT it.
-    You do not give the benefit of the doubt. Your default stance is REJECT unless the submission demonstrates absolute perfection against the rubric.
+    if mode == "Fail (Strict Audit / Default)":
+        system_instruction = """
+        You are an elite, hyper-critical technical project auditor. Your ultimate objective is to meticulously scrutinize the submission and find valid, rule-based reasons to REJECT it.
+        You do not give the benefit of the doubt. Your default stance is REJECT unless the submission demonstrates absolute perfection against the rubric.
 
-    YOUR RULES:
-    1. THE REJECTION DIRECTIVE: Actively search for missing files, superficial work, lack of depth, or ignored edge cases. If a rubric requirement asks for "detailed analysis" and the student provides brief work, you MUST reject it.
-    2. THE FAIRNESS DIRECTIVE: To remain fair, you must be completely factual. To justify a rejection, you must explicitly point to the exact rubric requirement that was missed.
-    3. ZERO TOLERANCE: If EVEN ONE sub-requirement is missing or incomplete, the status MUST be 'REJECT'. No partial credit.
-    4. Generate `email_subject` and `email_body`. The `email_body` MUST contain the comprehensive evaluation report, structured professionally, ready to be sent to the student directly. 
+        YOUR RULES:
+        1. THE REJECTION DIRECTIVE: Actively search for missing files, superficial work, lack of depth, or ignored edge cases. If a rubric requirement asks for "detailed analysis" and the student provides brief work, you MUST reject it.
+        2. THE FAIRNESS DIRECTIVE: To remain fair, you must be completely factual. To justify a rejection, you must explicitly point to the exact rubric requirement that was missed.
+        3. ZERO TOLERANCE: If EVEN ONE sub-requirement is missing or incomplete, the status MUST be 'REJECT'. No partial credit.
+        4. Generate `email_subject` and `email_body`. The `email_body` MUST contain the comprehensive evaluation report, structured professionally, ready to be sent to the student directly. 
 
-    [EMAIL DRAFT INSTRUCTIONS]
-    - Be highly professional, factual, cold, and direct. Start with "Dear Student,".
-    - Clearly state the project name and the final outcome (PASSED or REJECTED).
-    - Provide a detailed evaluation report WITHIN the email body itself.
-    - If REJECTED, strictly list the missing, incomplete, or incorrect requirements as bullet points. Explicitly state *why* based on the rubric.
-    - End with "Regards,\nEvaluation Team".
-    """
+        [EMAIL DRAFT INSTRUCTIONS]
+        - Be highly professional, factual, cold, and direct. Start with "Dear Student,".
+        - Clearly state the project name and the final outcome (PASSED or REJECTED).
+        - Provide a detailed evaluation report WITHIN the email body itself.
+        - If REJECTED, strictly list the missing, incomplete, or incorrect requirements as bullet points. Explicitly state *why* based on the rubric.
+        - End with "Regards,\nEvaluation Team".
+        """
+        response_schema = EvaluationResult
+
+    elif mode == "Pass (With Suggestions)":
+        system_instruction = """
+        You are an encouraging and supportive technical evaluator. Your objective is to thoroughly review the submission and ensure it PASSES, providing constructive feedback.
+
+        YOUR RULES:
+        1. THE PASS DIRECTIVE: Ensure the status is explicitly 'PASS'. Do not reject the submission.
+        2. CONSTRUCTIVE FEEDBACK: Identify areas where the student can improve, missing features, or edge cases missed, and list them strictly as "suggestions".
+        3. Generate `email_subject` and `email_body`. The email body MUST contain your evaluation and the list of suggestions.
+
+        [EMAIL DRAFT INSTRUCTIONS]
+        - Be professional, encouraging, and supportive. Start with "Dear Student,".
+        - Clearly state the project name and the outcome (PASSED).
+        - Provide a detailed evaluation report and your constructive suggestions for improvement WITHIN the email body itself.
+        - End with "Regards,\nEvaluation Team".
+        """
+        response_schema = PassEvaluationResult
+
+    elif mode == "Review Only (Comprehensive Analysis)":
+        system_instruction = """
+        You are an expert technical reviewer. Your sole objective is to provide a deeply comprehensive analysis report of the student's submission against the provided rubric.
+
+        YOUR RULES:
+        1. DO NOT assign a PASS or REJECT status.
+        2. DO NOT draft an email.
+        3. Produce ONLY a highly detailed, richly formatted Markdown analysis report covering strengths, weaknesses, missing elements, and architectural decisions.
+        """
+        response_schema = ReviewEvaluationResult
 
     prompt = f"""
     PROJECT RUBRICS TO ENFORCE:
@@ -1030,13 +1078,16 @@ def evaluate_submission(parsed_submission, active_rubrics):
     {submission_text}
     """
 
+    if additional_instructions.strip():
+        prompt += f"\n\nADDITIONAL INSTRUCTIONS FROM REVIEWER:\n{additional_instructions}"
+
     response = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
             response_mime_type="application/json",
-            response_schema=EvaluationResult,
+            response_schema=response_schema,
             temperature=0.1,
             max_output_tokens=8192
         )
@@ -1049,9 +1100,28 @@ def evaluate_submission(parsed_submission, active_rubrics):
 # ==========================================
 st.title("⚖️ Strict Student Project Evaluator AI")
 
+# State Management for persistent Chat functionality
+if 'eval_history' not in st.session_state:
+    st.session_state.eval_history = {}
+
+# Selection Tools
+col1, col2 = st.columns([2, 1])
+with col1:
+    eval_mode = st.radio(
+        "Select Evaluation Mode:",
+        ["Fail (Strict Audit / Default)", "Pass (With Suggestions)", "Review Only (Comprehensive Analysis)"],
+        horizontal=True
+    )
+with col2:
+    additional_instructs = st.text_area("Additional Prompt Instructions (Optional):", height=68,
+                                        placeholder="e.g. Focus specifically on database security...")
+
 uploaded_zips = st.file_uploader("Upload Student Submissions (.zip)", type=["zip"], accept_multiple_files=True)
 
 if st.button("Evaluate Submissions") and uploaded_zips:
+    # Clear history on new evaluation run
+    st.session_state.eval_history = {}
+
     for zip_file in uploaded_zips:
         st.write(f"### 📂 Processing: {zip_file.name}")
 
@@ -1081,30 +1151,128 @@ if st.button("Evaluate Submissions") and uploaded_zips:
                 st.error(f"Failed to identify projects. Error: {e}")
                 continue
 
-        with st.spinner("Executing strict audit against rubric..."):
+        with st.spinner(f"Executing AI Audit ({eval_mode.split(' ')[0]} Mode)..."):
             try:
-                result = evaluate_submission(parsed_files, active_rubrics)
+                result = evaluate_submission(parsed_files, active_rubrics, eval_mode, additional_instructs)
 
-                if result.get('overall_status') == 'PASS':
-                    st.success("✅ **OVERALL STATUS: PASS**")
-                else:
-                    st.error("❌ **OVERALL STATUS: REJECTED**")
-
-                for eval_data in result.get('evaluations', []):
-                    with st.expander(f"Evaluation: {eval_data['project_name']} - {eval_data['status']}", expanded=True):
-                        if eval_data['status'] == 'REJECT':
-                            st.error("**Missing/Failed Requirements Summary:**")
-                            for req in eval_data.get('missing_requirements', []): st.write(f"- {req}")
-                        else:
-                            st.success("✅ All core requirements met successfully.")
-
-                        st.write("---")
-                        st.write("📧 **Ready-to-Send Email Draft (Contains Full Report):**")
-                        st.text_input("Subject:", eval_data.get('email_subject', ''),
-                                      key=f"sub_{eval_data['project_name']}")
-                        st.text_area("Body:", eval_data.get('email_body', ''), height=400,
-                                     key=f"body_{eval_data['project_name']}")
+                # Save data to state for rendering and Chat functionality
+                st.session_state.eval_history[zip_file.name] = {
+                    'result': result,
+                    'parsed_files': parsed_files,
+                    'active_rubrics': active_rubrics,
+                    'mode': eval_mode,
+                    'chat_history': []
+                }
 
             except Exception as e:
                 st.error(f"Evaluation failed: {str(e)}")
-        st.markdown("---")
+
+# ==========================================
+# 5. RENDER RESULTS & CHAT ENGINE
+# ==========================================
+
+# Display stored results from state (Allows interacting without clearing the screen)
+for zip_name, data in st.session_state.eval_history.items():
+    result = data['result']
+    mode = data['mode']
+
+    st.markdown("---")
+    st.write(f"### 📄 Evaluation Results: `{zip_name}`")
+
+    if result.get('overall_status') == 'PASS':
+        st.success("✅ **OVERALL STATUS: PASS**")
+    elif result.get('overall_status') == 'REJECT':
+        st.error("❌ **OVERALL STATUS: REJECTED**")
+    else:
+        st.info("ℹ️ **OVERALL STATUS: REVIEW COMPLETED**")
+
+    for eval_data in result.get('evaluations', []):
+        expander_title = f"Evaluation: {eval_data['project_name']}"
+        if 'status' in eval_data: expander_title += f" - {eval_data['status']}"
+
+        with st.expander(expander_title, expanded=True):
+            if mode == "Fail (Strict Audit / Default)":
+                if eval_data.get('status') == 'REJECT':
+                    st.error("**Missing/Failed Requirements Summary:**")
+                    for req in eval_data.get('missing_requirements', []): st.write(f"- {req}")
+                else:
+                    st.success("✅ All core requirements met successfully.")
+
+                st.write("---")
+                st.write("📧 **Ready-to-Send Email Draft:**")
+                st.text_input("Subject:", eval_data.get('email_subject', ''),
+                              key=f"sub_{zip_name}_{eval_data['project_name']}")
+                st.text_area("Body:", eval_data.get('email_body', ''), height=400,
+                             key=f"body_{zip_name}_{eval_data['project_name']}")
+
+            elif mode == "Pass (With Suggestions)":
+                st.warning("💡 **Constructive Suggestions for Improvement:**")
+                for req in eval_data.get('suggestions', []): st.write(f"- {req}")
+
+                st.write("---")
+                st.write("📧 **Ready-to-Send Email Draft:**")
+                st.text_input("Subject:", eval_data.get('email_subject', ''),
+                              key=f"pass_sub_{zip_name}_{eval_data['project_name']}")
+                st.text_area("Body:", eval_data.get('email_body', ''), height=400,
+                             key=f"pass_body_{zip_name}_{eval_data['project_name']}")
+
+            elif mode == "Review Only (Comprehensive Analysis)":
+                st.write("📝 **Comprehensive Analysis Report:**")
+                st.markdown(eval_data.get('comprehensive_analysis_report', ''))
+
+# AI Chat Box at the very bottom
+if st.session_state.eval_history:
+    st.markdown("---")
+    st.markdown("### 💬 Discuss & Tweak AI Evaluation")
+
+    chat_target = st.selectbox("Select Submission Context to Discuss:", list(st.session_state.eval_history.keys()))
+    target_data = st.session_state.eval_history[chat_target]
+
+    # Display Chat History
+    for msg in target_data['chat_history']:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat Input
+    if chat_query := st.chat_input("Ask a question about the code, or ask AI to tweak the email/review..."):
+
+        target_data['chat_history'].append({"role": "user", "content": chat_query})
+        with st.chat_message("user"):
+            st.markdown(chat_query)
+
+        with st.chat_message("model"):
+            with st.spinner("AI is thinking..."):
+                # Formulate lightweight parsed submission context for Chat API
+                submission_text = ""
+                for filepath, content in target_data['parsed_files'].items():
+                    submission_text += f"\nFILE: {filepath}\n{content[:20000]}"  # Soft truncation to keep Chat snappy
+
+                system_instruction = f"""
+                You are assisting an evaluator tweaking or discussing a student project.
+                RUBRICS: {target_data['active_rubrics']}
+                INITIAL AI EVALUATION RESULT: {json.dumps(target_data['result'], indent=2)}
+                """
+
+                # Reconstruct conversation history for GenAI SDK
+                chat_contents = []
+                chat_contents.append(types.Content(role="user", parts=[
+                    types.Part.from_text(f"Here is the parsed student submission:\n{submission_text}")]))
+                chat_contents.append(types.Content(role="model", parts=[
+                    types.Part.from_text("Context loaded. How can I help you adjust the evaluation?")]))
+
+                for msg in target_data['chat_history'][:-1]:  # exclude the one we just appended
+                    chat_contents.append(types.Content(role=msg["role"], parts=[types.Part.from_text(msg["content"])]))
+
+                chat_contents.append(types.Content(role="user", parts=[types.Part.from_text(chat_query)]))
+
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=chat_contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.3
+                    )
+                )
+
+                st.markdown(response.text)
+                target_data['chat_history'].append({"role": "model", "content": response.text})
