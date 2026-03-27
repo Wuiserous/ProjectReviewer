@@ -941,42 +941,33 @@ def safe_json_parse(response_text):
         raise ValueError("Failed to parse AI output into valid JSON.")
 
 
-# ==========================================
-# 3. GEMINI EVALUATION AGENTS
-# ==========================================
+# --- PUT THESE CLASSES RIGHT ABOVE identify_projects ---
+class IdentifiedProject(BaseModel):
+    domain: str
+    project_name: str
+
+class IdentifiedProjects(BaseModel):
+    projects: list[IdentifiedProject] = Field(description="List of all projects the student attempted.")
+
+# --- REPLACE YOUR CURRENT identify_projects FUNCTION WITH THIS ---
 def identify_projects(parsed_submission):
-    # CRITICAL FIX 2: Sort files by depth (shortest paths first).
-    # This ensures the AI sees `package.json` and `README.md` at the root,
-    # rather than 50 deeply nested obscure components.
+    # Sort files by depth (shortest paths first) so AI sees root files like package.json
     file_list = list(parsed_submission.keys())
     file_list.sort(key=lambda x: x.count('/'))
-    important_files = file_list[:60]  # Only need top 60 highest-level files to identify a project
+    important_files = file_list[:60]
 
-    all_domains = list(PROJECT_DATABASE.keys())
-    all_projects = [proj_name for domain in PROJECT_DATABASE.values() for proj_name in domain.keys()]
-
-    # Strict Schema to force compliance
-    strict_schema = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "projects": types.Schema(
-                type=types.Type.ARRAY,
-                items=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "domain": types.Schema(type=types.Type.STRING, enum=all_domains),
-                        "project_name": types.Schema(type=types.Type.STRING, enum=all_projects)
-                    },
-                    required=["domain", "project_name"]
-                )
-            )
-        },
-        required=["projects"]
-    )
+    # Extract domains and sanitized project names to show the AI
+    project_titles_only = {
+        domain: list(projects.keys())
+        for domain, projects in PROJECT_DATABASE.items()
+    }
 
     prompt = f"""
     Identify WHICH project(s) the student is attempting based on the highest-level files submitted.
-    Match the project name exactly.
+    You MUST match the 'project_name' exactly to one of the titles in the 'Available Projects' list below.
+
+    Available Projects:
+    {json.dumps(project_titles_only, indent=2)}
 
     Root Files Submitted:
     {json.dumps(important_files, indent=2)}
@@ -987,7 +978,7 @@ def identify_projects(parsed_submission):
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=strict_schema,
+            response_schema=IdentifiedProjects, # We use Pydantic here instead of strict Enum
             temperature=0.0
         )
     )
