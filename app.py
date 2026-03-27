@@ -23,11 +23,6 @@ except ImportError:
 # ==========================================
 st.set_page_config(page_title="Robust Student Project Evaluator", layout="wide")
 
-# IMPORTANT: To allow Streamlit to accept ZIP files > 200MB,
-# you MUST create a file named `.streamlit/config.toml` in your project folder and add:
-# [server]
-# maxUploadSize = 1000  # (Allows up to 1GB)
-
 if 'API_KEY' not in st.secrets:
     st.error("API_KEY not found in Streamlit secrets. Please add it to your secrets.toml file.")
     st.stop()
@@ -39,8 +34,8 @@ except Exception as e:
     st.error(f"Failed to initialize Gemini Client: {e}")
     st.stop()
 
-# REPLACE THIS WITH YOUR FULL DATABASE
-PROJECT_DATABASE = {
+# RAW DATABASE (Will be sanitized below)
+RAW_PROJECT_DATABASE = {
     "Stock Market & Crypto": {
         "Institutional-Grade Equity Research Report": """
             Project: Deep Dive Initiation of Coverage on Tata Motors Ltd.
@@ -803,13 +798,22 @@ PROJECT_DATABASE = {
     }
 }
 
+# CRITICAL FIX 3: Sanitize Curly Quotes that crash the JSON Tokenizer
+PROJECT_DATABASE = {}
+for domain, projects in RAW_PROJECT_DATABASE.items():
+    PROJECT_DATABASE[domain] = {}
+    for proj_name, rubric in projects.items():
+        # Replace curly apostrophes and em-dashes with straight ones
+        clean_name = proj_name.replace("’", "'").replace("–", "-")
+        PROJECT_DATABASE[domain][clean_name] = rubric
+
 
 # ==========================================
 # 2. ROBUST INTELLIGENT FILE PARSERS
 # ==========================================
 def parse_csv(file_path):
     try:
-        df = pd.read_csv(file_path, nrows=20)  # Only top 20 rows to prevent token bloating
+        df = pd.read_csv(file_path, nrows=20)
         return f"[CSV Data - Top 20 Rows schema]\n{df.to_markdown()}"
     except Exception as e:
         return f"[Error reading CSV: {e}]"
@@ -830,7 +834,6 @@ def parse_pdf(file_path):
         text = ""
         with open(file_path, 'rb') as f:
             reader = PyPDF2.PdfReader(f)
-            # Limit to 50 pages to prevent massive token overflow
             for page in reader.pages[:50]:
                 extracted = page.extract_text()
                 if extracted:
@@ -853,7 +856,6 @@ def parse_ipynb(file_path):
         return f"[Error reading IPYNB: {e}]"
 
 
-# Directories & extensions that crash systems or waste AI tokens
 IGNORE_DIRS = {'node_modules', 'venv', 'env', '.git', '.idea', '__pycache__', '.pytest_cache', 'build', 'dist', '.next'}
 IGNORE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.mp4', '.sqlite3', '.db', '.exe', '.dll', '.so', '.class', '.pkl',
                '.h5', '.zip', '.tar', '.gz'}
@@ -862,132 +864,122 @@ IGNORE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.mp4', '.sqlite3', '.db', '.exe
 def process_zip_submission(zip_file):
     parsed_submission = {}
     total_chars = 0
-    MAX_TOTAL_CHARS = 3_000_000  # Cap total context ~ 750k tokens
-    MAX_FILE_CHARS = 100_000  # Cap individual file size
+    MAX_TOTAL_CHARS = 1_500_000
+    MAX_FILE_CHARS = 50_000
 
     with tempfile.TemporaryDirectory() as temp_dir:
         with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
 
-            for root, dirs, files in os.walk(temp_dir):
-                # Filter out heavy/useless directories in-place before traversing them
-                dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.')]
+            # CRITICAL FIX 1: Iterate the zip manifest directly. NEVER extractall() on 18,000 files!
+            for file_info in zip_ref.infolist():
+                if file_info.is_dir():
+                    continue
 
-                for file in files:
-                    if total_chars >= MAX_TOTAL_CHARS:
-                        parsed_submission[
-                            "WARNING"] = "OVERALL TEXT LIMIT REACHED. SOME FILES IGNORED TO PREVENT CRASHING."
-                        break
+                file_path = file_info.filename
 
-                    file_path = os.path.join(root, file)
-                    ext = os.path.splitext(file)[1].lower()
+                # Check for ignored directories IN the path before doing anything
+                path_parts = file_path.replace('\\', '/').split('/')
+                if any(part in IGNORE_DIRS or part.startswith('.') for part in path_parts) or '__MACOSX' in file_path:
+                    continue
 
-                    if file.startswith('.') or ext in IGNORE_EXTS or '__MACOSX' in root:
-                        continue
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext in IGNORE_EXTS:
+                    continue
 
-                    # Skip extremely large individual files (e.g. > 10MB) before trying to read them
-                    if os.path.getsize(file_path) > 10 * 1024 * 1024:
-                        parsed_submission[file] = f"[File ignored: Exceeds 10MB memory limit]"
-                        continue
+                if total_chars >= MAX_TOTAL_CHARS:
+                    parsed_submission["WARNING"] = "OVERALL TEXT LIMIT REACHED."
+                    break
 
-                    content = ""
+                if file_info.file_size > 5 * 1024 * 1024:
+                    parsed_submission[file_path] = "[File ignored: Exceeds 5MB limit]"
+                    continue
+
+                # Extract ONLY the safe, necessary files to the temp dir
+                extracted_path = zip_ref.extract(file_info, temp_dir)
+
+                content = ""
+                try:
                     if ext == '.csv':
-                        content = parse_csv(file_path)
+                        content = parse_csv(extracted_path)
                     elif ext == '.docx':
-                        content = parse_docx(file_path)
+                        content = parse_docx(extracted_path)
                     elif ext == '.pdf':
-                        content = parse_pdf(file_path)
+                        content = parse_pdf(extracted_path)
                     elif ext == '.ipynb':
-                        content = parse_ipynb(file_path)
+                        content = parse_ipynb(extracted_path)
                     else:
-                        # Fallback: Attempt to read anything else as a UTF-8 text file (.py, .js, .json, .txt, etc.)
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                content = f.read()
-                        except UnicodeDecodeError:
-                            continue  # It's a binary file, skip silently
-                        except Exception:
-                            continue
+                        with open(extracted_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                except UnicodeDecodeError:
+                    continue
+                except Exception:
+                    continue
 
-                    # Truncate individual massive files to protect AI context
-                    if len(content) > MAX_FILE_CHARS:
-                        content = content[:MAX_FILE_CHARS] + "\n\n...[CONTENT TRUNCATED DUE TO SIZE LIMIT]..."
+                if len(content) > MAX_FILE_CHARS:
+                    content = content[:MAX_FILE_CHARS] + "\n\n...[CONTENT TRUNCATED]..."
 
-                    rel_path = os.path.relpath(file_path, temp_dir)
-                    parsed_submission[rel_path] = content
-                    total_chars += len(content)
+                parsed_submission[file_path] = content
+                total_chars += len(content)
 
     return parsed_submission
 
 
 def safe_json_parse(response_text):
-    """Safely extracts JSON if wrapped in markdown blocks."""
     text = response_text.strip()
     if text.startswith("```json"):
         text = text[7:-3].strip()
     elif text.startswith("```"):
         text = text[3:-3].strip()
 
-    text = text.strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        # TRUNCATE the text to prevent Streamlit browser crash from infinite tabs!
         safe_text = text[:1500] + "\n\n...[RAW OUTPUT TRUNCATED TO PREVENT CRASH]..."
-        st.error(f"Critical JSON Parsing Error: The AI output was malformed.")
-        with st.expander("Show Raw AI Output for Debugging"):
+        st.error(f"Critical JSON Parsing Error: AI Hallucination detected.")
+        with st.expander("Show Raw AI Output"):
             st.code(safe_text)
         raise ValueError("Failed to parse AI output into valid JSON.")
+
 
 # ==========================================
 # 3. GEMINI EVALUATION AGENTS
 # ==========================================
-class IdentifiedProject(BaseModel):
-    domain: str
-    project_name: str
-
-
-class IdentifiedProjects(BaseModel):
-    projects: list[IdentifiedProject] = Field(description="List of all projects the student attempted.")
-
-
-class ProjectEvaluation(BaseModel):
-    project_name: str
-    status: str = Field(description="Must be 'PASS' or 'REJECT'")
-    missing_requirements: list[str] = Field(description="Strict list of missing/failed requirements. Empty if PASS.")
-    email_subject: str = Field(description="Subject line for the student email.")
-    email_body: str = Field(
-        description="Professional, comprehensive email body addressed to the student. Must contain the full detailed evaluation report, mentioning exactly what passed and what failed.")
-
-
-class EvaluationResult(BaseModel):
-    overall_status: str = Field(description="'PASS' only if ALL attempted projects pass. Otherwise 'REJECT'.")
-    evaluations: list[ProjectEvaluation]
-
-
 def identify_projects(parsed_submission):
-    # Only send up to 150 file paths to avoid overwhelming the AI's attention span
-    file_list = list(parsed_submission.keys())[:150]
+    # CRITICAL FIX 2: Sort files by depth (shortest paths first).
+    # This ensures the AI sees `package.json` and `README.md` at the root,
+    # rather than 50 deeply nested obscure components.
+    file_list = list(parsed_submission.keys())
+    file_list.sort(key=lambda x: x.count('/'))
+    important_files = file_list[:60]  # Only need top 60 highest-level files to identify a project
 
-    project_titles_only = {
-        domain: list(projects.keys())
-        for domain, projects in PROJECT_DATABASE.items()
-    }
+    all_domains = list(PROJECT_DATABASE.keys())
+    all_projects = [proj_name for domain in PROJECT_DATABASE.values() for proj_name in domain.keys()]
+
+    # Strict Schema to force compliance
+    strict_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "projects": types.Schema(
+                type=types.Type.ARRAY,
+                items=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "domain": types.Schema(type=types.Type.STRING, enum=all_domains),
+                        "project_name": types.Schema(type=types.Type.STRING, enum=all_projects)
+                    },
+                    required=["domain", "project_name"]
+                )
+            )
+        },
+        required=["projects"]
+    )
 
     prompt = f"""
-    Based on the following list of files submitted by a student, identify WHICH project(s) the student is attempting.
+    Identify WHICH project(s) the student is attempting based on the highest-level files submitted.
+    Match the project name exactly.
 
-    CRITICAL RULES:
-    1. Base your decision PRIMARILY on the names of the CODE files or REPORT files.
-    2. The 'project_name' MUST exactly match one of the available projects below.
-    3. ABSOLUTELY NO newlines (\\n) or tabs (\\t) are allowed in the output strings. Just output the exact text.
-
-    Submitted Files (Top 150):
-    {json.dumps(file_list, indent=2)}
-
-    Available Domains and Projects:
-    {json.dumps(project_titles_only, indent=2)}
+    Root Files Submitted:
+    {json.dumps(important_files, indent=2)}
     """
 
     response = client.models.generate_content(
@@ -995,39 +987,49 @@ def identify_projects(parsed_submission):
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=IdentifiedProjects,
-            temperature=0.2,  # Bumped to 0.2 to prevent infinite repetition loops
-            max_output_tokens=1024
+            response_schema=strict_schema,
+            temperature=0.0
         )
     )
     return safe_json_parse(response.text)
+
+
+class ProjectEvaluation(BaseModel):
+    project_name: str
+    status: str = Field(description="Must be 'PASS' or 'REJECT'")
+    missing_requirements: list[str] = Field(description="Strict list of missing/failed requirements. Empty if PASS.")
+    email_subject: str = Field(description="Subject line for the student email.")
+    email_body: str = Field(description="Highly professional email body stating facts.")
+
+
+class EvaluationResult(BaseModel):
+    overall_status: str = Field(description="'PASS' only if ALL attempted projects pass. Otherwise 'REJECT'.")
+    evaluations: list[ProjectEvaluation]
+
 
 def evaluate_submission(parsed_submission, active_rubrics):
     submission_text = ""
     for filepath, content in parsed_submission.items():
         submission_text += f"\n\n{'=' * 40}\nFILE: {filepath}\n{'=' * 40}\n{content}"
 
+    # REJECTION-BIASED INSTRUCTION
     system_instruction = """
-        You are an elite, hyper-critical technical project auditor. Your ultimate objective is to meticulously scrutinize the submission and find valid, rule-based reasons to REJECT it.
-        You do not give the benefit of the doubt. Your default stance is REJECT unless the submission demonstrates absolute perfection against the rubric.
+    You are an elite, hyper-critical technical project auditor. Your ultimate objective is to meticulously scrutinize the submission and find valid, rule-based reasons to REJECT it.
+    You do not give the benefit of the doubt. Your default stance is REJECT unless the submission demonstrates absolute perfection against the rubric.
 
-        YOUR RULES:
-        1. THE REJECTION DIRECTIVE: Actively search for missing files, superficial work, lack of depth, or ignored edge cases. If a rubric requirement asks for "detailed analysis", "deep dive", or "comprehensive models", and the student provides brief, basic, or barely-passing work, you MUST reject it for lacking depth.
-        2. THE FAIRNESS DIRECTIVE: To remain fair, you must be completely factual. To justify a rejection, you must explicitly point to the exact rubric requirement that was missed or inadequately addressed. Do not invent new rules; strictly weaponize the existing rubric.
-        3. ZERO TOLERANCE: If EVEN ONE sub-requirement is missing, incomplete, poorly formatted, or functionally incorrect, the entire project status MUST be 'REJECT'. No partial credit.
-        4. Generate `email_subject` and `email_body`. The `email_body` MUST contain the comprehensive evaluation report, structured professionally, ready to be sent to the student directly. 
+    YOUR RULES:
+    1. THE REJECTION DIRECTIVE: Actively search for missing files, superficial work, lack of depth, or ignored edge cases. If a rubric requirement asks for "detailed analysis" and the student provides brief work, you MUST reject it.
+    2. THE FAIRNESS DIRECTIVE: To remain fair, you must be completely factual. To justify a rejection, you must explicitly point to the exact rubric requirement that was missed.
+    3. ZERO TOLERANCE: If EVEN ONE sub-requirement is missing or incomplete, the status MUST be 'REJECT'. No partial credit.
+    4. Generate `email_subject` and `email_body`. The `email_body` MUST contain the comprehensive evaluation report, structured professionally, ready to be sent to the student directly. 
 
-        [EMAIL DRAFT INSTRUCTIONS]
-        - Be highly professional, factual, cold, and direct.
-        - Start with "Dear Student,".
-        - Clearly state the project name and the final outcome (PASSED or REJECTED).
-        - Provide a detailed evaluation report WITHIN the email body itself:
-            * Outline what specific requirements were evaluated.
-            * Provide specific feedback on each requirement (met vs not met).
-        - If REJECTED, strictly list the missing, incomplete, or incorrect requirements as bullet points. Explicitly state *why* their work was insufficient based on the rubric (e.g., "The rubric required 5 years of financial analysis, but only 3 were provided.").
-        - Do not offer alternative solutions, encouragement, or pleasantries. Just state the cold facts.
-        - End with "Regards,\nEvaluation Team".
-        """
+    [EMAIL DRAFT INSTRUCTIONS]
+    - Be highly professional, factual, cold, and direct. Start with "Dear Student,".
+    - Clearly state the project name and the final outcome (PASSED or REJECTED).
+    - Provide a detailed evaluation report WITHIN the email body itself.
+    - If REJECTED, strictly list the missing, incomplete, or incorrect requirements as bullet points. Explicitly state *why* based on the rubric.
+    - End with "Regards,\nEvaluation Team".
+    """
 
     prompt = f"""
     PROJECT RUBRICS TO ENFORCE:
@@ -1045,7 +1047,7 @@ def evaluate_submission(parsed_submission, active_rubrics):
             response_mime_type="application/json",
             response_schema=EvaluationResult,
             temperature=0.1,
-            max_output_tokens=8192  # Raised limit to accommodate long, fully detailed emails
+            max_output_tokens=8192
         )
     )
     return safe_json_parse(response.text)
@@ -1056,19 +1058,15 @@ def evaluate_submission(parsed_submission, active_rubrics):
 # ==========================================
 st.title("⚖️ Strict Student Project Evaluator AI")
 
-st.info(
-    "💡 **Pro Tip:** To evaluate files over 200MB, add a `.streamlit/config.toml` file to your project root and set `maxUploadSize = 1000`.")
-
 uploaded_zips = st.file_uploader("Upload Student Submissions (.zip)", type=["zip"], accept_multiple_files=True)
 
 if st.button("Evaluate Submissions") and uploaded_zips:
-
     for zip_file in uploaded_zips:
         st.write(f"### 📂 Processing: {zip_file.name}")
 
-        with st.spinner("Unzipping and safely filtering files..."):
+        with st.spinner("Rapidly extracting & filtering core files..."):
             parsed_files = process_zip_submission(zip_file)
-            st.caption(f"Successfully processed {len(parsed_files)} relevant files (Skipped ignored folders/binaries).")
+            st.caption(f"Successfully processed {len(parsed_files)} valid source files.")
 
         with st.spinner("Identifying attempted projects..."):
             try:
@@ -1076,7 +1074,7 @@ if st.button("Evaluate Submissions") and uploaded_zips:
                 detected_projects = identified_data.get('projects', [])
 
                 if not detected_projects:
-                    st.error("Could not match the submitted files to any known project in the database.")
+                    st.error("Could not match the submitted files to any known project.")
                     continue
 
                 project_names = [p['project_name'] for p in detected_projects]
@@ -1089,10 +1087,10 @@ if st.button("Evaluate Submissions") and uploaded_zips:
                     active_rubrics += f"--- RUBRIC FOR: {p['project_name']} ---\n{rubric}\n\n"
 
             except Exception as e:
-                st.error(f"Failed to identify projects. Skipping this file. Error: {e}")
+                st.error(f"Failed to identify projects. Error: {e}")
                 continue
 
-        with st.spinner("Harshly evaluating against strict requirements..."):
+        with st.spinner("Executing strict audit against rubric..."):
             try:
                 result = evaluate_submission(parsed_files, active_rubrics)
 
@@ -1103,11 +1101,9 @@ if st.button("Evaluate Submissions") and uploaded_zips:
 
                 for eval_data in result.get('evaluations', []):
                     with st.expander(f"Evaluation: {eval_data['project_name']} - {eval_data['status']}", expanded=True):
-
                         if eval_data['status'] == 'REJECT':
                             st.error("**Missing/Failed Requirements Summary:**")
-                            for req in eval_data.get('missing_requirements', []):
-                                st.write(f"- {req}")
+                            for req in eval_data.get('missing_requirements', []): st.write(f"- {req}")
                         else:
                             st.success("✅ All core requirements met successfully.")
 
@@ -1120,5 +1116,4 @@ if st.button("Evaluate Submissions") and uploaded_zips:
 
             except Exception as e:
                 st.error(f"Evaluation failed: {str(e)}")
-
         st.markdown("---")
