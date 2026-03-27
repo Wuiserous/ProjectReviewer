@@ -928,17 +928,17 @@ def safe_json_parse(response_text):
     elif text.startswith("```"):
         text = text[3:-3].strip()
 
-    # Sometimes Gemini generates infinite newlines at the end. Strip them out.
     text = text.strip()
 
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        st.error(f"Critical JSON Parsing Error: {e}")
+        # TRUNCATE the text to prevent Streamlit browser crash from infinite tabs!
+        safe_text = text[:1500] + "\n\n...[RAW OUTPUT TRUNCATED TO PREVENT CRASH]..."
+        st.error(f"Critical JSON Parsing Error: The AI output was malformed.")
         with st.expander("Show Raw AI Output for Debugging"):
-            st.code(text)
-        raise e
-
+            st.code(safe_text)
+        raise ValueError("Failed to parse AI output into valid JSON.")
 
 # ==========================================
 # 3. GEMINI EVALUATION AGENTS
@@ -967,7 +967,8 @@ class EvaluationResult(BaseModel):
 
 
 def identify_projects(parsed_submission):
-    file_list = list(parsed_submission.keys())
+    # Only send up to 150 file paths to avoid overwhelming the AI's attention span
+    file_list = list(parsed_submission.keys())[:150]
 
     project_titles_only = {
         domain: list(projects.keys())
@@ -978,10 +979,11 @@ def identify_projects(parsed_submission):
     Based on the following list of files submitted by a student, identify WHICH project(s) the student is attempting.
 
     CRITICAL RULES:
-    1. Base your decision PRIMARILY on the names of the CODE files (e.g., .ipynb, .py) or REPORT files (e.g., .docx, .pdf).
-    2. DO NOT assume a project is being attempted just because a specific dataset file (e.g., .csv) is present.
+    1. Base your decision PRIMARILY on the names of the CODE files or REPORT files.
+    2. The 'project_name' MUST exactly match one of the available projects below.
+    3. ABSOLUTELY NO newlines (\\n) or tabs (\\t) are allowed in the output strings. Just output the exact text.
 
-    Submitted Files:
+    Submitted Files (Top 150):
     {json.dumps(file_list, indent=2)}
 
     Available Domains and Projects:
@@ -994,12 +996,11 @@ def identify_projects(parsed_submission):
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=IdentifiedProjects,
-            temperature=0.1,  # Shifted slightly from 0.0 to prevent infinite looping bug
-            max_output_tokens=2048
+            temperature=0.2,  # Bumped to 0.2 to prevent infinite repetition loops
+            max_output_tokens=1024
         )
     )
     return safe_json_parse(response.text)
-
 
 def evaluate_submission(parsed_submission, active_rubrics):
     submission_text = ""
