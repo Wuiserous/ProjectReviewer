@@ -1098,7 +1098,7 @@ def evaluate_submission(parsed_submission, active_rubrics, mode, additional_inst
 # ==========================================
 # 4. STREAMLIT DASHBOARD UI
 # ==========================================
-st.title("⚖️ Strict Student Project Evaluator AI")
+st.title("Project Evaluator AI Agent")
 
 # State Management for persistent Chat functionality
 if 'eval_history' not in st.session_state:
@@ -1255,15 +1255,23 @@ if st.session_state.eval_history:
 
                 # Reconstruct conversation history for GenAI SDK
                 chat_contents = []
-                chat_contents.append(types.Content(role="user", parts=[
-                    types.Part.from_text(f"Here is the parsed student submission:\n{submission_text}")]))
-                chat_contents.append(types.Content(role="model", parts=[
-                    types.Part.from_text("Context loaded. How can I help you adjust the evaluation?")]))
+                chat_contents.append(
+                    types.Content(role="user", parts=[
+                        types.Part.from_text(text=f"Here is the parsed student submission:\n{submission_text}")])
+                )
+                chat_contents.append(
+                    types.Content(role="model", parts=[
+                        types.Part.from_text(text="Context loaded. How can I help you adjust the evaluation?")])
+                )
 
                 for msg in target_data['chat_history'][:-1]:  # exclude the one we just appended
-                    chat_contents.append(types.Content(role=msg["role"], parts=[types.Part.from_text(msg["content"])]))
+                    chat_contents.append(
+                        types.Content(role=msg["role"], parts=[types.Part.from_text(text=msg["content"])])
+                    )
 
-                chat_contents.append(types.Content(role="user", parts=[types.Part.from_text(chat_query)]))
+                chat_contents.append(
+                    types.Content(role="user", parts=[types.Part.from_text(text=chat_query)])
+                )
 
                 response = client.models.generate_content(
                     model='gemini-2.5-flash',
